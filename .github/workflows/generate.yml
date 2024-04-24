@@ -1,0 +1,17 @@
+name: generate
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '5 0 */7 * *'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+    - name: Gh login
+      run: echo ${{ secrets.GITHUB_TOKEN }} | gh auth login --with-token; gh auth setup-git; gh auth status
+    - name: Run
+      run: ./generate

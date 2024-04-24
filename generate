@@ -1,0 +1,137 @@
+#!/bin/bash
+set -e
+
+if [[ $1 = [0-9].[0-9]* ]]; then
+    VERSION=($1)
+else
+	VERSION=(
+		$(curl -sL https://kernel.org | grep -A1 longterm: | sed -n 's/.*strong>\(.*\)<\/strong.*/\1/p')
+	)
+fi
+
+colorize() {
+	if tput setaf 0 &>/dev/null; then
+		ALL_OFF="$(tput sgr0)"
+		BOLD="$(tput bold)"
+		BLUE="${BOLD}$(tput setaf 4)"
+		GREEN="${BOLD}$(tput setaf 2)"
+		RED="${BOLD}$(tput setaf 1)"
+		YELLOW="${BOLD}$(tput setaf 3)"
+	else
+		ALL_OFF="\e[0m"
+		BOLD="\e[1m"
+		BLUE="${BOLD}\e[34m"
+		GREEN="${BOLD}\e[32m"
+		RED="${BOLD}\e[31m"
+		YELLOW="${BOLD}\e[33m"
+	fi
+	readonly ALL_OFF BOLD BLUE GREEN RED YELLOW
+}
+
+warning() {
+	local mesg=$1; shift
+	printf "${YELLOW}==> WARNING${ALL_OFF}${BOLD} ${mesg}${ALL_OFF} %s\n" "$*" >&2
+}
+
+error() {
+	local mesg=$1; shift
+	printf "${RED}==> ERROR:${ALL_OFF}${BOLD} ${mesg}${ALL_OFF} %s\n" "$*" >&2
+	exit 1
+}
+
+checkout_repo() {
+	local branch="$1"
+	local major  minor current
+	CURRENT= NO_ORIG=
+	install -d ${branch}
+	cd ${branch}; git init 2>/dev/null
+	git remote add origin "https://github.com/${GITHUB_REPOSITORY}"
+	git pull --depth=1 origin ${branch} || NO_ORIG=1
+	if ! [ "${NO_ORIG}" ]; then
+		git switch -q ${branch}
+		major="$(grep LINUX_VERSION_MAJOR linux/version.h | cut -d' ' -f3)"
+		minor="$(grep LINUX_VERSION_PATCHLEVEL linux/version.h | cut -d' ' -f3)"
+		current="$(grep LINUX_VERSION_SUBLEVEL linux/version.h | cut -d' ' -f3)"
+		[[ ${major}.${minor} = ${branch} ]] || error "${major}.${minor} != ${branch}"
+		CURRENT=${current}
+	fi
+	cd ..
+}
+
+generate() {
+	local a b="$2"
+	local branch="$1"
+	if [[ ${CURRENT} ]]; then
+		a="${CURRENT}"
+	else
+		mk_headers "${branch}" origin
+		wget -nv "https://cdn.kernel.org/pub/linux/kernel/v${branch%%.*}.x/patch-${branch}.1.xz"
+		unxz patch-${branch}.1.xz; patch -sp1 -i ../patch-${branch}.1 -d work-${branch}
+		mk_headers "${branch}.1"
+		a=1
+	fi
+	while ((a<b)); do
+		wget -nv "https://cdn.kernel.org/pub/linux/kernel/v${branch%.*}.x/incr/patch-${branch}.$a-$((a+1)).xz"
+		unxz patch-${branch}.$a-$((a+1)).xz; patch -sp1 < patch-${branch}.$a-$((a+1)) -d work-${branch}
+		mk_headers "${branch}.$((a+1))"
+		((a++)) || true
+	done
+}
+
+getsrc() {
+	local version="$1"
+	local outdir="$2"
+	wget -nv -c "https://cdn.kernel.org/pub/linux/kernel/v${version%%.*}.x/linux-${version}.tar.xz"
+	tar xf linux-${version}.tar.xz -C ${outdir} --strip-components=1
+}
+
+mk_headers() {
+	local branch
+	local dest=$(mktemp -d)
+	[ $# -eq 1 ] && branch=${1%.*} || branch=$1
+	cd work-${branch}
+	make -s mrproper
+	make -s headers_install INSTALL_HDR_PATH=${dest}
+	find "${dest}" -type f ! -name '*.h' -delete
+	cd ../${branch}
+	rm -rf *; cp -r ${dest}/include/* .
+	git add .
+	git commit -m "linux-$1" || warning commit No change $1
+	git branch -m ${branch}
+	cd ..
+}
+
+prepare() {
+	local branch="$1"
+	install -d work-${branch}
+	if [[ ${CURRENT} ]]; then
+		getsrc "${branch}.${CURRENT}" work-${branch}
+	else
+		getsrc "${branch}" work-${branch}
+	fi
+}
+
+if [[ $(hostname) = fv-az*-* ]]; then
+	git config --global user.name "github-actions"
+	git config --global user.email "action@github.com"
+fi
+
+colorize
+set -x
+
+for b in ${VERSION[@]}; do
+	MAJOR="${b%%.*}"
+	if [[ ${MAJOR} -le 5 ]]; then
+		if [[ ${MAJOR} -eq 5 ]]; then
+			MINOR="${b#${MAJOR}.}"
+			[[ ${MINOR%.*} -ge 15 ]] || continue
+		else
+			continue
+		fi
+	fi
+	checkout_repo "${b%.*}"
+	[[ ${CURRENT} != ${b##*.} ]] || continue
+	prepare "${b%.*}"
+	generate "${b%.*}" "${b##*.}"
+	(cd "${b%.*}"; git push origin "${b%.*}")
+done
